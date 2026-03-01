@@ -78,7 +78,7 @@ Once connected:
 | `?`                                  | Toggle help popup (`/` to filter inside)           |
 | `Ctrl+Shift+B` / `Ctrl+\` / `Ctrl+4` | Toggle sidebar                                     |
 | `Ctrl+O`                             | Open connection picker                             |
-| `Ctrl+M`                             | Open connection manager                            |
+| `Ctrl+Shift+C` / `gm`                | Open connection manager                            |
 | `q`                                  | Quit application                                   |
 | `Esc`                                | Return to normal mode / close popups               |
 
@@ -194,7 +194,7 @@ See [config.example.toml](config.example.toml) for all available options.
 
 ### 1Password integration
 
-Connection entries support an optional **1Password ref** field (`op://vault/item/field`). When set, `tsql` calls `op read` at connect time to resolve the password, inheriting your shell's `PATH` and active `op` session token. Configure it via the connection manager (`Ctrl+M`).
+Connection entries support an optional **1Password ref** field (`op://vault/item/field`). When set, `tsql` calls `op read` at connect time to resolve the password, inheriting your shell's `PATH` and active `op` session token. Configure it via the connection manager (`Ctrl+Shift+C` or `gm`).
 
 ## Requirements
 

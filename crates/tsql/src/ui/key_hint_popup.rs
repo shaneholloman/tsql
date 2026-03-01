@@ -37,6 +37,7 @@ const G_HINTS: &[KeyHint] = &[
     KeyHint::new("s", "schema"),
     KeyHint::new("r", "results"),
     KeyHint::new("h", "history"),
+    KeyHint::new("m", "manager"),
 ];
 
 /// Hints for schema table actions (started by Enter on a table in the schema panel)
@@ -180,12 +181,12 @@ mod tests {
         let popup = KeyHintPopup::new(PendingKey::G);
         let hints = popup.hints();
 
-        assert_eq!(hints.len(), 6);
+        assert_eq!(hints.len(), 7);
         assert_eq!(hints[0].key, "g");
         assert_eq!(hints[0].description, "first row");
         assert_eq!(hints[1].key, "e");
-        assert_eq!(hints[4].key, "r");
         assert_eq!(hints[5].key, "h");
+        assert_eq!(hints[6].key, "m");
     }
 
     #[test]

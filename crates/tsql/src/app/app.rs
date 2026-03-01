@@ -2447,8 +2447,20 @@ impl App {
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
-                // Ctrl+M: Open connection manager
-                (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+                // Ctrl+Shift+C: Open connection manager
+                (code @ (KeyCode::Char('c') | KeyCode::Char('C')), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && (modifiers.contains(KeyModifiers::SHIFT)
+                            || matches!(code, KeyCode::Char('C'))) =>
+                {
+                    self.open_connection_manager();
+                    return false;
+                }
+                // Fallback for terminals that collapse Ctrl+Shift+C into Ctrl+C.
+                // Limit this to Query focus to avoid stealing Ctrl+C in Grid.
+                (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                    if matches!(self.focus, Focus::Query) && !self.db.running =>
+                {
                     self.open_connection_manager();
                     return false;
                 }
@@ -4622,17 +4634,6 @@ impl App {
                             }
                             return;
                         }
-                        // vv - open query in external editor
-                        ('v', KeyCode::Char('v'), KeyModifiers::NONE) => {
-                            self.pending_external_edit = true;
-                            return;
-                        }
-                        // v<anything> - start visual mode (second key discarded)
-                        ('v', _, _) => {
-                            self.editor.textarea.start_selection();
-                            self.mode = Mode::Visual;
-                            return;
-                        }
                         _ => {
                             // Unknown combo, ignore pending
                             return;
@@ -4802,9 +4803,11 @@ impl App {
                         self.editor.textarea.redo();
                     }
 
-                    // Visual mode / external editor (vv).
+                    // Visual mode.
                     (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                        self.pending_key = Some('v');
+                        self.pending_key = Some('v'); // mark possible `vv`
+                        self.editor.textarea.start_selection();
+                        self.mode = Mode::Visual;
                     }
 
                     // Paste.
@@ -4953,6 +4956,20 @@ impl App {
             }
 
             Mode::Visual => {
+                // `vv` from Normal mode:
+                // first `v` enters visual mode and sets pending_key='v'; second `v`
+                // opens the external editor.
+                if self.pending_key == Some('v') {
+                    if key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::NONE {
+                        self.editor.textarea.cancel_selection();
+                        self.mode = Mode::Normal;
+                        self.pending_key = None;
+                        self.pending_external_edit = true;
+                        return;
+                    }
+                    self.pending_key = None;
+                }
+
                 // In visual mode, movement extends selection, y/d/c act on selection.
                 match (key.code, key.modifiers) {
                     // Exit visual mode.
@@ -5260,22 +5277,25 @@ impl App {
         let entries: Vec<ConnectionEntry> =
             self.connections.sorted().into_iter().cloned().collect();
 
-        let picker = FuzzyPicker::with_display(entries, "Connect (Ctrl+M: manage)", |entry| {
-            // Display: "[fav] name - user@host/db"
-            let fav = entry
-                .favorite
-                .map(|f| format!("[{}] ", f))
-                .unwrap_or_default();
-            format!("{}{} - {}", fav, entry.name, entry.short_display())
-        });
+        let picker =
+            FuzzyPicker::with_display(entries, "Connect (Ctrl+Shift+C: manage)", |entry| {
+                // Display: "[fav] name - user@host/db"
+                let fav = entry
+                    .favorite
+                    .map(|f| format!("[{}] ", f))
+                    .unwrap_or_default();
+                format!("{}{} - {}", fav, entry.name, entry.short_display())
+            });
 
         self.connection_picker = Some(picker);
     }
 
     /// Handle key events when connection picker is open.
     fn handle_connection_picker_key(&mut self, key: KeyEvent) -> bool {
-        // Check for Ctrl+M to open connection manager
-        if key.code == KeyCode::Char('m') && key.modifiers == KeyModifiers::CONTROL {
+        // Check for Ctrl+Shift+C (or Ctrl+C fallback) to open connection manager
+        if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             self.connection_picker = None;
             self.open_connection_manager();
             return false;
@@ -5464,6 +5484,9 @@ impl App {
             }
             KeySequenceAction::GotoHistory => {
                 self.open_history_picker();
+            }
+            KeySequenceAction::OpenConnectionManager => {
+                self.open_connection_manager();
             }
 
             KeySequenceAction::SchemaTableSelect
@@ -6835,9 +6858,9 @@ impl App {
         let pinned_count = entries.iter().filter(|e| e.pinned).count();
 
         if self.history_picker_pinned_only && pinned_count == 0 {
-            self.last_status = Some("No pinned queries".to_string());
-            self.history_picker = None;
-            return;
+            // Never trap the user in an empty pinned-only view.
+            self.history_picker_pinned_only = false;
+            self.last_status = Some("No pinned queries; showing full history".to_string());
         }
 
         let total = self.history.len();
@@ -8007,6 +8030,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_history_ctrl_t_with_no_pinned_keeps_full_view_open() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        app.history.push("select 1".to_string(), None);
+        app.history.push("select 2".to_string(), None);
+
+        app.open_history_picker();
+        assert!(app.history_picker.is_some());
+        assert!(!app.history_picker_pinned_only);
+
+        app.handle_history_picker_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+        assert!(app.history_picker.is_some());
+        assert!(!app.history_picker_pinned_only);
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No pinned queries; showing full history")
+        );
+    }
+
+    #[test]
+    fn test_history_pinned_only_unpin_last_falls_back_to_full_view() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        app.history.push("select 1".to_string(), None);
+        app.history.push("select 2".to_string(), None);
+        app.history.toggle_pin(0);
+
+        app.history_picker_pinned_only = true;
+        app.open_history_picker();
+        assert!(app.history_picker.is_some());
+        assert!(app.history_picker_pinned_only);
+
+        app.handle_history_picker_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(app.history_picker.is_some());
+        assert!(!app.history_picker_pinned_only);
+        assert!(app.history.entries().iter().all(|e| !e.pinned));
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No pinned queries; showing full history")
+        );
+    }
+
+    #[test]
+    fn test_v_enters_visual_and_vv_requests_external_editor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.pending_key, Some('v'));
+        assert!(!app.pending_external_edit);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pending_key, None);
+        assert!(app.pending_external_edit);
+    }
+
     // ========== Connection Manager Issue Tests ==========
 
     /// Helper to type a string into the app by simulating key presses
@@ -8491,6 +8600,33 @@ mod tests {
         assert_eq!(app.grid_keymap.get(&ctrl_r), Some(&Action::GotoResults));
     }
 
+    #[test]
+    fn test_gm_opens_connection_manager() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(
+            app.connection_manager.is_none(),
+            "First key of sequence should not open manager yet"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(
+            app.connection_manager.is_some(),
+            "gm should open connection manager"
+        );
+    }
+
     // ========== Tab Cycling Focus Tests ==========
 
     #[test]
@@ -8824,6 +8960,72 @@ mod tests {
             app.sidebar.schema_state.selected(),
             &["schema:_sqlx_test".to_string()],
             "Ctrl+Shift+B should select the first schema item"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_c_fallback_opens_connection_manager_from_query_when_idle() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.db.running = false;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(
+            app.connection_manager.is_some(),
+            "Ctrl+C fallback should open connection manager from Query when idle"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_c_does_not_open_connection_manager_from_grid() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Grid;
+        app.mode = Mode::Normal;
+        app.db.running = false;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(
+            app.connection_manager.is_none(),
+            "Ctrl+C should not open connection manager from Grid"
         );
     }
 

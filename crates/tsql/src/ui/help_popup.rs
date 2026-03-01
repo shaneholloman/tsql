@@ -80,7 +80,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
         KeyBinding::new("Ctrl+o", "Open connection picker"),
-        KeyBinding::new("Ctrl+M", "Open connection manager"),
+        KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
     ],
 );
@@ -93,6 +93,7 @@ const GOTO: HelpSection = HelpSection::new(
         KeyBinding::new("gc", "Go to connections sidebar"),
         KeyBinding::new("gs", "Go to schema sidebar"),
         KeyBinding::new("gr", "Go to results grid"),
+        KeyBinding::new("gm", "Open connection manager"),
     ],
 );
 

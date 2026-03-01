@@ -60,6 +60,8 @@ pub enum KeySequenceAction {
     GotoResults,
     /// Open the history picker
     GotoHistory,
+    /// Open the connection manager
+    OpenConnectionManager,
 
     // ─────────────────────────────────────────────────────────────────────
     // Schema panel table templates (Enter + key)
@@ -208,6 +210,7 @@ impl<C> KeySequenceHandlerWithContext<C> {
                 's' => Some(KeySequenceAction::GotoTables),
                 'r' => Some(KeySequenceAction::GotoResults),
                 'h' => Some(KeySequenceAction::GotoHistory),
+                'm' => Some(KeySequenceAction::OpenConnectionManager),
                 _ => None,
             },
             PendingKey::SchemaTable => match c {
@@ -345,6 +348,21 @@ mod tests {
             result,
             KeySequenceResult::Completed(KeySequenceCompletion {
                 action: KeySequenceAction::GotoHistory,
+                context: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_g_sequence_gm() {
+        let mut handler = KeySequenceHandler::new(500);
+
+        handler.process_first_key('g');
+        let result = handler.process_second_key('m');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::OpenConnectionManager,
                 context: None
             })
         );
