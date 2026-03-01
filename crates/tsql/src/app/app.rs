@@ -2151,7 +2151,9 @@ impl App {
 
             if self.pending_external_edit {
                 self.pending_external_edit = false;
-                self.open_in_external_editor(terminal)?;
+                if let Err(e) = self.open_in_external_editor(terminal) {
+                    self.last_error = Some(format!("External editor failed: {e}"));
+                }
             }
         }
 
@@ -5231,7 +5233,11 @@ impl App {
                 Ok(Some(pwd)) => Some(pwd),
                 Ok(None) => None,
                 Err(e) => {
-                    self.last_error = Some(format!("Failed to get password: {}", e));
+                    self.last_error = None;
+                    self.last_status = Some(format!(
+                        "Password lookup failed ({}); enter password manually",
+                        e
+                    ));
                     None
                 }
             };
@@ -5247,6 +5253,7 @@ impl App {
             self.start_connect(url);
         } else {
             // Need to prompt for password
+            self.last_error = None;
             self.password_prompt = Some(PasswordPrompt::new(entry));
         }
     }

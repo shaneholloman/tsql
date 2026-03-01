@@ -281,6 +281,7 @@ pub fn load_config_from(path: &PathBuf) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[test]

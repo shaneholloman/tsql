@@ -183,11 +183,24 @@ fn onepassword_cli_available() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn onepassword_startup_warning(onepassword_enabled: bool) -> Option<String> {
-    if onepassword_enabled && !onepassword_cli_available() {
+    if !onepassword_enabled {
+        return None;
+    }
+
+    if !cfg!(unix) {
+        return Some(
+            "1Password support is currently available only on Unix-like systems (Linux/macOS). \
+             Disable `connection.enable_onepassword` on this platform."
+                .to_string(),
+        );
+    }
+
+    if !onepassword_cli_available() {
         return Some(
             "1Password support is enabled, but `op` was not found on PATH. Install/sign in via \
              1Password CLI or disable `connection.enable_onepassword`."
@@ -299,7 +312,12 @@ fn main() -> Result<()> {
             let connections = load_connections().unwrap_or_default();
             if let Some(entry) = connections.find_by_name(&conn_name) {
                 // Check if password is available (not requiring prompt)
-                match entry.get_password_with_options(onepassword_enabled) {
+                let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
+                    5000
+                } else {
+                    500
+                };
+                match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
                     Ok(Some(_)) | Ok(None) => {
                         // Password available or not needed - auto-connect
                         app.connect_to_entry(entry.clone());

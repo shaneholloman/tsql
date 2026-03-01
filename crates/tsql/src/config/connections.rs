@@ -419,9 +419,12 @@ impl ConnectionEntry {
 
     /// Get the password using the configured method.
     ///
-    /// Precedence: environment variable → 1Password CLI → OS keychain.
+    /// Precedence: environment variable → OS keychain.
+    ///
+    /// This method keeps 1Password disabled by default so callers that want
+    /// 1Password lookup must opt in via [`Self::get_password_with_options`].
     pub fn get_password(&self) -> Result<Option<String>> {
-        self.get_password_with_options(true)
+        self.get_password_with_options(false)
     }
 
     /// Get the password using the configured method, optionally disabling 1Password.
