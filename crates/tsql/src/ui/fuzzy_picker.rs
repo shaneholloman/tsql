@@ -93,6 +93,20 @@ impl<T: Clone + AsRef<str>> FuzzyPicker<T> {
 }
 
 impl<T: Clone> FuzzyPicker<T> {
+    fn char_count(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+        text.char_indices()
+            .nth(char_index)
+            .map_or(text.len(), |(idx, _)| idx)
+    }
+
+    fn normalize_query_cursor(&mut self) {
+        self.cursor = self.cursor.min(Self::char_count(&self.query));
+    }
+
     /// Create a new fuzzy picker with a custom display function.
     pub fn with_display(
         items: Vec<T>,
@@ -232,22 +246,29 @@ impl<T: Clone> FuzzyPicker<T> {
 
             // Query editing.
             (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                self.query.insert(self.cursor, c);
+                self.normalize_query_cursor();
+                let byte_index = Self::char_to_byte_index(&self.query, self.cursor);
+                self.query.insert(byte_index, c);
                 self.cursor += 1;
                 self.update_filtered();
                 PickerAction::Continue
             }
             (KeyCode::Backspace, _) => {
+                self.normalize_query_cursor();
                 if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.query.remove(self.cursor);
+                    let remove_char_idx = self.cursor - 1;
+                    let remove_byte_idx = Self::char_to_byte_index(&self.query, remove_char_idx);
+                    self.query.remove(remove_byte_idx);
+                    self.cursor = remove_char_idx;
                     self.update_filtered();
                 }
                 PickerAction::Continue
             }
             (KeyCode::Delete, _) => {
-                if self.cursor < self.query.len() {
-                    self.query.remove(self.cursor);
+                self.normalize_query_cursor();
+                if self.cursor < Self::char_count(&self.query) {
+                    let remove_byte_idx = Self::char_to_byte_index(&self.query, self.cursor);
+                    self.query.remove(remove_byte_idx);
                     self.update_filtered();
                 }
                 PickerAction::Continue
@@ -259,7 +280,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 PickerAction::Continue
             }
             (KeyCode::Right, _) => {
-                if self.cursor < self.query.len() {
+                if self.cursor < Self::char_count(&self.query) {
                     self.cursor += 1;
                 }
                 PickerAction::Continue
@@ -269,7 +290,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 PickerAction::Continue
             }
             (KeyCode::End, _) => {
-                self.cursor = self.query.len();
+                self.cursor = Self::char_count(&self.query);
                 PickerAction::Continue
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -281,12 +302,16 @@ impl<T: Clone> FuzzyPicker<T> {
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                 // Delete word backwards.
                 while self.cursor > 0 && self.query.chars().nth(self.cursor - 1) == Some(' ') {
-                    self.cursor -= 1;
-                    self.query.remove(self.cursor);
+                    let remove_char_idx = self.cursor - 1;
+                    let remove_byte_idx = Self::char_to_byte_index(&self.query, remove_char_idx);
+                    self.query.remove(remove_byte_idx);
+                    self.cursor = remove_char_idx;
                 }
                 while self.cursor > 0 && self.query.chars().nth(self.cursor - 1) != Some(' ') {
-                    self.cursor -= 1;
-                    self.query.remove(self.cursor);
+                    let remove_char_idx = self.cursor - 1;
+                    let remove_byte_idx = Self::char_to_byte_index(&self.query, remove_char_idx);
+                    self.query.remove(remove_byte_idx);
+                    self.cursor = remove_char_idx;
                 }
                 self.update_filtered();
                 PickerAction::Continue
@@ -773,6 +798,51 @@ mod tests {
 
         picker.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(picker.query(), "a");
+    }
+
+    #[test]
+    fn test_picker_unicode_editing_from_set_query() {
+        let items = vec!["test"];
+        let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
+
+        // set_query stores cursor as character index.
+        picker.set_query("é".to_string());
+        assert_eq!(picker.cursor, 1);
+
+        // This used to panic because insert used cursor as byte index.
+        picker.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(picker.query(), "éx");
+        assert_eq!(picker.cursor, 2);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(picker.cursor, 1);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(picker.query(), "é");
+        assert_eq!(picker.cursor, 1);
+    }
+
+    #[test]
+    fn test_picker_unicode_backspace_and_ctrl_w() {
+        let items = vec!["test"];
+        let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char('—'), KeyModifiers::NONE));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(picker.query(), "—a");
+        assert_eq!(picker.cursor, 2);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(picker.query(), "—");
+        assert_eq!(picker.cursor, 1);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('β'), KeyModifiers::NONE));
+        assert_eq!(picker.query(), "— β");
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(picker.query(), "— ");
+        assert_eq!(picker.cursor, 2);
     }
 
     #[test]
