@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::DateTime;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -1022,13 +1023,48 @@ fn json_value_to_bson(value: &serde_json::Value) -> std::result::Result<Bson, St
         }
         serde_json::Value::Object(map) => {
             if map.len() == 1 {
-                if let Some(oid_value) = map.get("$oid") {
-                    let oid_hex = oid_value
-                        .as_str()
-                        .ok_or_else(|| "$oid value must be a string".to_string())?;
-                    let oid = ObjectId::parse_str(oid_hex)
-                        .map_err(|_| format!("Invalid ObjectId hex: {oid_hex}"))?;
-                    return Ok(Bson::ObjectId(oid));
+                if let Some((key, ext_value)) = map.iter().next() {
+                    match key.as_str() {
+                        "$oid" => {
+                            let oid_hex = ext_value
+                                .as_str()
+                                .ok_or_else(|| "$oid value must be a string".to_string())?;
+                            let oid = ObjectId::parse_str(oid_hex)
+                                .map_err(|_| format!("Invalid ObjectId hex: {oid_hex}"))?;
+                            return Ok(Bson::ObjectId(oid));
+                        }
+                        "$date" => {
+                            return parse_ejson_date(ext_value).map(Bson::DateTime);
+                        }
+                        "$numberLong" => {
+                            let raw = ext_value
+                                .as_str()
+                                .ok_or_else(|| "$numberLong value must be a string".to_string())?;
+                            let parsed = raw
+                                .parse::<i64>()
+                                .map_err(|_| format!("Invalid $numberLong value: {raw}"))?;
+                            return Ok(Bson::Int64(parsed));
+                        }
+                        "$numberInt" => {
+                            let raw = ext_value
+                                .as_str()
+                                .ok_or_else(|| "$numberInt value must be a string".to_string())?;
+                            let parsed = raw
+                                .parse::<i32>()
+                                .map_err(|_| format!("Invalid $numberInt value: {raw}"))?;
+                            return Ok(Bson::Int32(parsed));
+                        }
+                        "$numberDecimal" => {
+                            let raw = ext_value.as_str().ok_or_else(|| {
+                                "$numberDecimal value must be a string".to_string()
+                            })?;
+                            let parsed = raw
+                                .parse::<bson::Decimal128>()
+                                .map_err(|_| format!("Invalid $numberDecimal value: {raw}"))?;
+                            return Ok(Bson::Decimal128(parsed));
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -1038,6 +1074,30 @@ fn json_value_to_bson(value: &serde_json::Value) -> std::result::Result<Bson, St
             }
             Ok(Bson::Document(doc))
         }
+    }
+}
+
+fn parse_ejson_date(value: &serde_json::Value) -> std::result::Result<bson::DateTime, String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let dt = DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| format!("Invalid $date value: {raw}"))?;
+            Ok(bson::DateTime::from_millis(dt.timestamp_millis()))
+        }
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            if let Some(number_long) = map.get("$numberLong") {
+                let raw = number_long
+                    .as_str()
+                    .ok_or_else(|| "$date.$numberLong value must be a string".to_string())?;
+                let millis = raw
+                    .parse::<i64>()
+                    .map_err(|_| format!("Invalid $date.$numberLong value: {raw}"))?;
+                Ok(bson::DateTime::from_millis(millis))
+            } else {
+                Err("$date object must use $numberLong".to_string())
+            }
+        }
+        _ => Err("$date value must be an RFC3339 string or $numberLong".to_string()),
     }
 }
 
@@ -1137,7 +1197,93 @@ fn starts_with_token(chars: &[char], start: usize, token: &str) -> bool {
     chars[start..start + token_chars.len()] == token_chars
 }
 
-fn rewrite_object_id_constructors(input: &str) -> std::result::Result<String, String> {
+fn matches_identifier_token(chars: &[char], start: usize, token: &str) -> bool {
+    starts_with_token(chars, start, token)
+        && (start == 0 || !is_js_identifier_continue(chars[start - 1]))
+        && (start + token.len() == chars.len()
+            || !is_js_identifier_continue(chars[start + token.len()]))
+}
+
+fn parse_constructor_string_arg(arg: &str, name: &str) -> std::result::Result<String, String> {
+    let trimmed = arg.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.is_empty() {
+        return Err(format!("{name}(...) requires an argument"));
+    }
+    if chars[0] != '"' && chars[0] != '\'' {
+        return Err(format!("{name}(...) requires a quoted string"));
+    }
+    let (parsed, end) = parse_js_string_literal(&chars, 0)?;
+    if chars[end..].iter().any(|ch| !ch.is_whitespace()) {
+        return Err(format!("{name}(...) has unexpected trailing text"));
+    }
+    Ok(parsed)
+}
+
+fn parse_constructor_scalar_arg(arg: &str, name: &str) -> std::result::Result<String, String> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{name}(...) requires an argument"));
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars[0] == '"' || chars[0] == '\'' {
+        parse_constructor_string_arg(arg, name)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn ejson_single_string_field(key: &str, value: &str) -> String {
+    format!(
+        "{{\"{key}\":{}}}",
+        serde_json::to_string(value).expect("string serialization should not fail")
+    )
+}
+
+fn rewrite_single_constructor(name: &str, arg: &str) -> std::result::Result<String, String> {
+    match name {
+        "ObjectId" => {
+            let hex = parse_constructor_string_arg(arg, "ObjectId")?;
+            ObjectId::parse_str(&hex).map_err(|_| format!("Invalid ObjectId hex: {hex}"))?;
+            Ok(ejson_single_string_field("$oid", &hex))
+        }
+        "ISODate" => {
+            let raw = parse_constructor_string_arg(arg, "ISODate")?;
+            DateTime::parse_from_rfc3339(&raw)
+                .map_err(|_| format!("Invalid ISODate value: {raw}"))?;
+            Ok(ejson_single_string_field("$date", &raw))
+        }
+        "NumberLong" => {
+            let raw = parse_constructor_scalar_arg(arg, "NumberLong")?;
+            raw.parse::<i64>()
+                .map_err(|_| format!("Invalid NumberLong value: {raw}"))?;
+            Ok(ejson_single_string_field("$numberLong", &raw))
+        }
+        "NumberInt" => {
+            let raw = parse_constructor_scalar_arg(arg, "NumberInt")?;
+            raw.parse::<i32>()
+                .map_err(|_| format!("Invalid NumberInt value: {raw}"))?;
+            Ok(ejson_single_string_field("$numberInt", &raw))
+        }
+        "NumberDecimal" => {
+            let raw = parse_constructor_scalar_arg(arg, "NumberDecimal")?;
+            raw.parse::<bson::Decimal128>()
+                .map_err(|_| format!("Invalid NumberDecimal value: {raw}"))?;
+            Ok(ejson_single_string_field("$numberDecimal", &raw))
+        }
+        _ => Err(format!("Unsupported constructor: {name}")),
+    }
+}
+
+fn rewrite_mongo_constructors(input: &str) -> std::result::Result<String, String> {
+    const CONSTRUCTORS: [&str; 5] = [
+        "ObjectId",
+        "ISODate",
+        "NumberLong",
+        "NumberInt",
+        "NumberDecimal",
+    ];
+
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len() + 16);
     let mut i = 0usize;
@@ -1153,12 +1299,13 @@ fn rewrite_object_id_constructors(input: &str) -> std::result::Result<String, St
             continue;
         }
 
-        if starts_with_token(&chars, i, "ObjectId")
-            && (i == 0 || !is_js_identifier_continue(chars[i - 1]))
-            && (i + "ObjectId".len() == chars.len()
-                || !is_js_identifier_continue(chars[i + "ObjectId".len()]))
-        {
-            let mut j = i + "ObjectId".len();
+        let matched_constructor = CONSTRUCTORS
+            .iter()
+            .copied()
+            .find(|name| matches_identifier_token(&chars, i, name));
+
+        if let Some(name) = matched_constructor {
+            let mut j = i + name.len();
             while j < chars.len() && chars[j].is_whitespace() {
                 j += 1;
             }
@@ -1167,28 +1314,54 @@ fn rewrite_object_id_constructors(input: &str) -> std::result::Result<String, St
                 i += 1;
                 continue;
             }
-            j += 1;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            if j >= chars.len() || (chars[j] != '"' && chars[j] != '\'') {
-                return Err("ObjectId(...) requires a quoted hex string".to_string());
-            }
-            let (hex, end_of_string) = parse_js_string_literal(&chars, j)?;
-            let mut k = end_of_string;
-            while k < chars.len() && chars[k].is_whitespace() {
+
+            let arg_start = j + 1;
+            let mut depth = 1usize;
+            let mut k = arg_start;
+            let mut string_quote: Option<char> = None;
+            let mut escape = false;
+            while k < chars.len() {
+                let current = chars[k];
+                if let Some(quote) = string_quote {
+                    if escape {
+                        escape = false;
+                    } else if current == '\\' {
+                        escape = true;
+                    } else if current == quote {
+                        string_quote = None;
+                    }
+                    k += 1;
+                    continue;
+                }
+
+                match current {
+                    '"' | '\'' => {
+                        string_quote = Some(current);
+                    }
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
                 k += 1;
             }
-            if k >= chars.len() || chars[k] != ')' {
-                return Err("ObjectId(...) is missing closing ')'".to_string());
+
+            if depth != 0 || k >= chars.len() {
+                return Err(format!("{name}(...) is missing closing ')'"));
             }
 
-            ObjectId::parse_str(&hex).map_err(|_| format!("Invalid ObjectId hex: {hex}"))?;
-            out.push_str("{\"$oid\":");
-            out.push_str(
-                &serde_json::to_string(&hex).expect("string serialization should not fail"),
-            );
-            out.push('}');
+            let arg_raw: String = chars[arg_start..k].iter().collect();
+            let args = split_top_level_args(&arg_raw);
+            if args.len() != 1 {
+                return Err(format!("{name}(...) requires exactly one argument"));
+            }
+
+            let rewritten = rewrite_single_constructor(name, &args[0])?;
+            out.push_str(&rewritten);
             i = k + 1;
             continue;
         }
@@ -1303,8 +1476,8 @@ fn normalize_js_like_json(input: &str) -> std::result::Result<String, String> {
 }
 
 fn normalize_mongo_relaxed_json(input: &str) -> std::result::Result<String, String> {
-    let with_object_ids = rewrite_object_id_constructors(input)?;
-    normalize_js_like_json(&with_object_ids)
+    let with_constructors = rewrite_mongo_constructors(input)?;
+    normalize_js_like_json(&with_constructors)
 }
 
 fn parse_mongo_arg(arg: &str, idx: usize) -> std::result::Result<serde_json::Value, String> {
@@ -1314,13 +1487,13 @@ fn parse_mongo_arg(arg: &str, idx: usize) -> std::result::Result<serde_json::Val
 
     let normalized = normalize_mongo_relaxed_json(arg).map_err(|e| {
         format!(
-            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and ObjectId(\"507f1f77bcf86cd799439011\")"
+            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and constructors like ObjectId(\"507f1f77bcf86cd799439011\") or ISODate(\"2024-01-01T00:00:00Z\")"
         )
     })?;
 
     serde_json::from_str(&normalized).map_err(|e| {
         format!(
-            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and ObjectId(\"507f1f77bcf86cd799439011\")"
+            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and constructors like ObjectId(\"507f1f77bcf86cd799439011\") or ISODate(\"2024-01-01T00:00:00Z\")"
         )
     })
 }
@@ -11092,6 +11265,80 @@ mod tests {
         assert!(
             err.contains("ObjectId"),
             "error should mention ObjectId: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_iso_date_constructor() {
+        let parsed =
+            parse_mongo_query(r#"db.events.find({ created_at: ISODate("2024-01-02T03:04:05Z") })"#)
+                .unwrap();
+
+        match parsed {
+            MongoQuery::Find { filter, .. } => {
+                let millis = DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .timestamp_millis();
+                assert_eq!(
+                    filter.get("created_at"),
+                    Some(&Bson::DateTime(bson::DateTime::from_millis(millis)))
+                );
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_numeric_constructors() {
+        let parsed = parse_mongo_query(
+            r#"db.metrics.find({ small: NumberInt(42), big: NumberLong("9007199254740991"), amount: NumberDecimal("12.34") })"#,
+        )
+        .unwrap();
+
+        match parsed {
+            MongoQuery::Find { filter, .. } => {
+                assert_eq!(filter.get("small"), Some(&Bson::Int32(42)));
+                assert_eq!(filter.get("big"), Some(&Bson::Int64(9007199254740991)));
+                assert_eq!(
+                    filter.get("amount"),
+                    Some(&Bson::Decimal128(
+                        "12.34".parse::<bson::Decimal128>().unwrap()
+                    ))
+                );
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_extended_json_date_and_numberlong() {
+        let parsed = parse_mongo_query(
+            r#"db.metrics.find({"ts": {"$date": "2024-01-02T03:04:05Z"}, "n": {"$numberLong": "9"}})"#,
+        )
+        .unwrap();
+
+        match parsed {
+            MongoQuery::Find { filter, .. } => {
+                let millis = DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .timestamp_millis();
+                assert_eq!(
+                    filter.get("ts"),
+                    Some(&Bson::DateTime(bson::DateTime::from_millis(millis)))
+                );
+                assert_eq!(filter.get("n"), Some(&Bson::Int64(9)));
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_rejects_invalid_number_int_constructor() {
+        let err = parse_mongo_query(r#"db.t.find({ value: NumberInt("999999999999") })"#)
+            .expect_err("invalid NumberInt should fail");
+        assert!(
+            err.contains("NumberInt"),
+            "error should mention NumberInt: {err}"
         );
     }
 
