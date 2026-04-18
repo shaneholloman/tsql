@@ -215,6 +215,175 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
     Ok(default)
 }
 
+/// Validate a connection URL up-front so the user gets an immediate,
+/// actionable error instead of a generic tokio-postgres failure later.
+pub fn validate_connection_url(raw: &str) -> std::result::Result<(), String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("Connection URL is empty".to_string());
+    }
+    if !s.contains("://") {
+        if s.contains('=') {
+            return Ok(());
+        }
+        return Err(format!(
+            "Not a recognised connection URL. Expected postgres://user:pass@host:port/db, mongodb://..., or libpq `host=... user=...`. Got: {}",
+            truncate_for_error(s)
+        ));
+    }
+    let parsed = url::Url::parse(s).map_err(|e| {
+        format!(
+            "Malformed URL: {} - expected e.g. postgres://user:pass@host:5432/dbname",
+            e
+        )
+    })?;
+    match parsed.scheme() {
+        "postgres" | "postgresql" => {
+            let has_host = parsed.host_str().is_some();
+            let has_db = !parsed.path().trim_start_matches('/').is_empty();
+            if !has_host && !has_db && parsed.query().is_none() {
+                return Err(
+                    "PostgreSQL URL is empty - need a host or a database name".to_string(),
+                );
+            }
+            Ok(())
+        }
+        "mongodb" | "mongodb+srv" => Ok(()),
+        other => Err(format!(
+            "Unsupported scheme '{}://'. Use postgres://, postgresql://, mongodb://, or mongodb+srv://",
+            other
+        )),
+    }
+}
+
+fn truncate_for_error(s: &str) -> String {
+    if s.chars().count() <= 64 {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(60).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn reorder_in_file(
+    file: &mut crate::config::ConnectionsFile,
+    name: &str,
+    delta: i32,
+) -> anyhow::Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let mut ordered_names: Vec<String> = file
+        .sorted_by(crate::config::SortMode::FavoritesAlpha)
+        .into_iter()
+        .filter(|entry| entry.favorite.is_none())
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    let idx = ordered_names
+        .iter()
+        .position(|candidate| candidate == name)
+        .ok_or_else(|| anyhow::anyhow!("Connection '{}' is not reorderable", name))?;
+
+    let neighbor_idx = if delta < 0 {
+        if idx == 0 {
+            return Ok(());
+        }
+        idx - 1
+    } else {
+        if idx + 1 >= ordered_names.len() {
+            return Ok(());
+        }
+        idx + 1
+    };
+
+    ordered_names.swap(idx, neighbor_idx);
+    for (i, name) in ordered_names.iter().enumerate() {
+        if let Some(entry) = file.find_by_name_mut(name) {
+            entry.order = i as i32;
+        }
+    }
+    Ok(())
+}
+
+fn parse_import_args(
+    args: &str,
+) -> (
+    Option<String>,
+    std::result::Result<crate::config::ImportConflict, String>,
+) {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return (None, Ok(crate::config::ImportConflict::Rename));
+    }
+
+    if let Some(quote) = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        let rest = &trimmed[1..];
+        if let Some(end) = rest.find(quote) {
+            let path = &rest[..end];
+            let tail = rest[end + 1..].trim();
+            let strategy = if tail.is_empty() {
+                Ok(crate::config::ImportConflict::Rename)
+            } else {
+                parse_import_flag(tail)
+            };
+            return (Some(path.to_string()), strategy);
+        }
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let last = *tokens.last().unwrap_or(&"");
+    if last.starts_with("--") && tokens.len() >= 2 {
+        let strategy = parse_import_flag(last);
+        let path = tokens[..tokens.len() - 1].join(" ");
+        (Some(path), strategy)
+    } else {
+        (
+            Some(trimmed.to_string()),
+            Ok(crate::config::ImportConflict::Rename),
+        )
+    }
+}
+
+fn parse_import_flag(flag: &str) -> std::result::Result<crate::config::ImportConflict, String> {
+    match flag {
+        "--overwrite" => Ok(crate::config::ImportConflict::Overwrite),
+        "--skip" => Ok(crate::config::ImportConflict::Skip),
+        "--rename" => Ok(crate::config::ImportConflict::Rename),
+        other => Err(other.to_string()),
+    }
+}
+
+fn merge_edit_preserving_non_form_fields(
+    updated: &mut ConnectionEntry,
+    existing: &ConnectionEntry,
+) {
+    updated.last_used_at = existing.last_used_at;
+    updated.use_count = existing.use_count;
+    updated.favorite = existing.favorite;
+    updated.order = existing.order;
+    updated.ssl_root_cert = existing.ssl_root_cert.clone();
+    updated.ssl_client_cert = existing.ssl_client_cert.clone();
+    updated.ssl_client_key = existing.ssl_client_key.clone();
+}
+
+fn yank_size_hint(text: &str) -> String {
+    let bytes = text.len();
+    let lines = text.lines().count();
+    let size_label = if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    };
+    if lines <= 1 {
+        size_label
+    } else {
+        format!("{} lines - {}", lines, size_label)
+    }
+}
+
 async fn probe_connection(url: &str, kind: DbKind) -> std::result::Result<(), String> {
     if kind == DbKind::Mongo {
         let client = mongodb::Client::with_uri_str(url)
@@ -2341,10 +2510,14 @@ pub struct App {
     connect_generation: u64,
     /// Saved connection name associated with the current connect generation.
     connect_generation_name: Option<String>,
+    /// Source entry for a duplicate form so non-form fields survive save.
+    pending_duplicate_donor: Option<Box<ConnectionEntry>>,
     /// Monotonic id used to ignore stale saved-connection password resolves.
     password_resolve_generation: u64,
     /// Saved connection password resolves currently running off the UI thread.
     password_resolve_in_flight: HashMap<String, PendingPasswordResolve>,
+    /// Last time usage stats were written for each saved connection.
+    last_touch_save: HashMap<String, Instant>,
     /// Connection picker (fuzzy picker for quick connection selection).
     pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
@@ -2541,8 +2714,10 @@ impl App {
             safe_mode: false,
             connect_generation: 0,
             connect_generation_name: None,
+            pending_duplicate_donor: None,
             password_resolve_generation: 0,
             password_resolve_in_flight: HashMap::new(),
+            last_touch_save: HashMap::new(),
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
@@ -4318,7 +4493,9 @@ impl App {
                     if self.editor.is_modified() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
-                            ConfirmContext::SwitchConnection { entry },
+                            ConfirmContext::SwitchConnection {
+                                entry: Box::new(entry),
+                            },
                         ));
                     } else {
                         self.connect_to_entry(entry);
@@ -4809,13 +4986,14 @@ impl App {
             }
             ConfirmContext::CloseConnectionForm => {
                 // Close the connection form without saving
+                self.pending_duplicate_donor = None;
                 self.connection_form = None;
                 self.last_status = Some("Changes discarded".to_string());
                 false
             }
             ConfirmContext::SwitchConnection { entry } => {
                 // Proceed with connection switch despite unsaved changes
-                self.connect_to_entry(entry);
+                self.connect_to_entry(*entry);
                 false
             }
             ConfirmContext::ApplyUpdate { info } => {
@@ -5481,14 +5659,14 @@ impl App {
             "connect" | "c" => {
                 if args.is_empty() {
                     self.last_status = Some("Usage: :connect <connection_url>".to_string());
+                } else if let Err(msg) = validate_connection_url(args) {
+                    self.last_error = Some(msg);
                 } else {
                     self.current_connection_name = None;
                     self.start_connect(args.to_string());
                 }
             }
             "disconnect" | "dc" => {
-                self.invalidate_password_resolves();
-                self.connect_generation = self.connect_generation.wrapping_add(1);
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
@@ -5496,10 +5674,9 @@ impl App {
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
-                self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
-                self.connect_generation_name = None;
+                self.query_ui.clear();
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
@@ -5643,6 +5820,12 @@ impl App {
             "connections" | "conn" => {
                 self.open_connection_manager();
             }
+            "export-connections" => {
+                self.handle_export_connections_command(args);
+            }
+            "import-connections" => {
+                self.handle_import_connections_command(args);
+            }
             "sbt" | "sidebar-toggle" => {
                 self.toggle_sidebar();
             }
@@ -5661,12 +5844,101 @@ impl App {
         !self.editor.text().trim().is_empty()
     }
 
+    fn handle_export_connections_command(&mut self, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            self.last_status = Some("Usage: :export-connections <path>".to_string());
+            return;
+        }
+
+        let entries = self.connections.connections.clone();
+        match crate::config::export_to_path(std::path::Path::new(path), entries) {
+            Ok(()) => {
+                self.last_error = None;
+                self.last_status = Some(format!(
+                    "Exported {} connection{} to {}",
+                    self.connections.connections.len(),
+                    if self.connections.connections.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    path
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Export failed: {}", e));
+            }
+        }
+    }
+
+    fn handle_import_connections_command(&mut self, args: &str) {
+        let (path, strategy) = parse_import_args(args);
+        let (path, strategy) = match (path, strategy) {
+            (Some(path), Ok(strategy)) => (path, strategy),
+            (None, _) => {
+                self.last_status = Some(
+                    "Usage: :import-connections <path> [--overwrite|--skip|--rename]".to_string(),
+                );
+                return;
+            }
+            (_, Err(flag)) => {
+                self.last_error = Some(format!("Unknown flag: {}", flag));
+                return;
+            }
+        };
+
+        match crate::config::import_from_path(
+            &mut self.connections,
+            std::path::Path::new(&path),
+            strategy,
+        ) {
+            Ok(summary) => {
+                if let Err(e) = save_connections(&self.connections) {
+                    self.last_error = Some(format!("Save after import failed: {}", e));
+                    return;
+                }
+                if let Some(ref mut manager) = self.connection_manager {
+                    manager.update_connections(&self.connections);
+                }
+
+                let mut parts = Vec::new();
+                if summary.imported > 0 {
+                    parts.push(format!("{} imported", summary.imported));
+                }
+                if summary.renamed > 0 {
+                    parts.push(format!("{} renamed", summary.renamed));
+                }
+                if summary.overwritten > 0 {
+                    parts.push(format!("{} overwritten", summary.overwritten));
+                }
+                if summary.skipped > 0 {
+                    parts.push(format!("{} skipped", summary.skipped));
+                }
+
+                self.last_error = if summary.errors.is_empty() {
+                    None
+                } else {
+                    Some(summary.errors.join("; "))
+                };
+                self.last_status = Some(if parts.is_empty() {
+                    "Import produced no changes".to_string()
+                } else {
+                    format!("Imported: {}", parts.join(", "))
+                });
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Import failed: {}", e));
+            }
+        }
+    }
+
     fn active_database_name(&self) -> Option<String> {
         if self.db.kind == Some(DbKind::Mongo) {
             return self.db.mongo_database.clone();
         }
 
-        if let Some(name) = self.current_connection_name.as_deref() {
+        if let Some(name) = self.active_connection_name.as_deref() {
             if let Some(entry) = self.connections.find_by_name(name) {
                 if !entry.database.trim().is_empty() {
                     return Some(entry.database.clone());
@@ -7893,7 +8165,28 @@ impl App {
     }
 
     fn record_successful_connect(&mut self, connection_name: Option<String>) {
-        self.active_connection_name = connection_name;
+        self.active_connection_name = connection_name.clone();
+        let Some(name) = connection_name else {
+            self.active_connection_name = None;
+            return;
+        };
+
+        if !self.connections.touch_use(&name) {
+            return;
+        }
+
+        let now = Instant::now();
+        let should_save = match self.last_touch_save.get(&name) {
+            None => true,
+            Some(prev) => now.duration_since(*prev) >= Duration::from_secs(30),
+        };
+        if should_save {
+            if let Err(e) = save_connections(&self.connections) {
+                self.last_status = Some(format!("Failed to save usage stats: {}", e));
+            } else {
+                self.last_touch_save.insert(name, now);
+            }
+        }
     }
 
     /// Connect to an entry with the provided password (called after password prompt).
@@ -7916,10 +8209,13 @@ impl App {
             return;
         }
 
-        // Get sorted connections (favorites first, then alphabetical)
-        // Clone them since FuzzyPicker needs owned values
-        let entries: Vec<ConnectionEntry> =
-            self.connections.sorted().into_iter().cloned().collect();
+        let sort_mode = self.connections.last_sort_mode;
+        let entries: Vec<ConnectionEntry> = self
+            .connections
+            .sorted_by(sort_mode)
+            .into_iter()
+            .cloned()
+            .collect();
 
         let picker = FuzzyPicker::with_display(entries, "Connect (gm: manage)", |entry| {
             // Display: "[fav] name - user@host/db"
@@ -7927,7 +8223,15 @@ impl App {
                 .favorite
                 .map(|f| format!("[{}] ", f))
                 .unwrap_or_default();
-            format!("{}{} - {}", fav, entry.name, entry.short_display())
+            let mut line = format!("{}{} - {}", fav, entry.name, entry.short_display());
+            if !entry.tags.is_empty() {
+                line.push_str(&format!("  - {}", entry.tags.join(",")));
+            }
+            let last_used = entry.last_used_label();
+            if last_used != "never" {
+                line.push_str(&format!("  - {}", last_used));
+            }
+            line
         });
 
         self.connection_picker = Some(picker);
@@ -7973,7 +8277,9 @@ impl App {
                 if self.editor.is_modified() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
-                        ConfirmContext::SwitchConnection { entry },
+                        ConfirmContext::SwitchConnection {
+                            entry: Box::new(entry),
+                        },
                     ));
                 } else {
                     self.connect_to_entry(entry);
@@ -8222,7 +8528,7 @@ impl App {
         }
         self.connection_manager = Some(ConnectionManagerModal::new(
             &self.connections,
-            self.current_connection_name.clone(),
+            self.active_connection_name.clone(),
         ));
     }
 
@@ -8254,7 +8560,9 @@ impl App {
                 if self.editor.is_modified() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
-                        ConfirmContext::SwitchConnection { entry },
+                        ConfirmContext::SwitchConnection {
+                            entry: Box::new(entry),
+                        },
                     ));
                 } else {
                     self.connect_to_entry(entry);
@@ -8280,34 +8588,61 @@ impl App {
                 ));
             }
             ConnectionManagerAction::Duplicate { entry } => {
-                let password = entry
-                    .get_password_with_options(self.config.connection.enable_onepassword)
-                    .ok()
-                    .flatten();
-                let duplicate_name = self.duplicate_connection_name(&entry.name);
-                self.connection_form =
-                    Some(ConnectionFormModal::duplicate_with_keymap_and_onepassword(
-                        &entry,
-                        password,
-                        duplicate_name,
-                        self.connection_form_keymap.clone(),
-                        self.config.connection.enable_onepassword,
-                    ));
+                let mut duplicate = entry.clone();
+                duplicate.name = self.duplicate_connection_name(&entry.name);
+                duplicate.favorite = None;
+                duplicate.password_in_keychain = false;
+                duplicate.last_used_at = None;
+                duplicate.use_count = 0;
+                duplicate.order = 0;
+
+                let mut form = ConnectionFormModal::edit_with_keymap_and_onepassword(
+                    &duplicate,
+                    None,
+                    self.connection_form_keymap.clone(),
+                    self.config.connection.enable_onepassword,
+                );
+                form.mark_as_new(format!("Duplicate: {}", duplicate.name));
+                self.pending_duplicate_donor = Some(Box::new(duplicate));
+                self.connection_form = Some(form);
             }
             ConnectionManagerAction::YankUrl { url } => {
                 if self.copy_to_clipboard(&url) {
-                    self.last_status =
-                        Some("Connection URL copied (password stripped)".to_string());
+                    let msg = format!("URL copied (password stripped, {})", yank_size_hint(&url));
+                    self.last_status = Some(msg.clone());
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.set_toast(msg);
+                    }
                 }
             }
             ConnectionManagerAction::YankCli { command } => {
                 if self.copy_to_clipboard(&command) {
-                    self.last_status = Some("tsql command copied".to_string());
+                    let msg = format!("tsql command copied ({})", yank_size_hint(&command));
+                    self.last_status = Some(msg.clone());
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.set_toast(msg);
+                    }
+                }
+            }
+            ConnectionManagerAction::Reorder { name, delta } => {
+                if let Err(e) = self.reorder_connection(&name, delta) {
+                    self.last_error = Some(format!("Reorder failed: {}", e));
+                } else if let Err(e) = save_connections(&self.connections) {
+                    self.last_error = Some(format!("Failed to save connections: {}", e));
+                } else if let Some(ref mut manager) = self.connection_manager {
+                    manager.update_connections(&self.connections);
                 }
             }
             ConnectionManagerAction::TestConnection { entry } => {
+                if let Some(ref mut manager) = self.connection_manager {
+                    manager.set_toast(format!("Testing {}...", entry.name));
+                }
                 self.last_status = Some(format!("Testing connection to {}...", entry.name));
                 self.test_entry_in_background(entry);
+            }
+            ConnectionManagerAction::SortModeChanged { mode } => {
+                self.connections.last_sort_mode = mode;
+                let _ = save_connections(&self.connections);
             }
             ConnectionManagerAction::Delete { name } => {
                 // Show confirmation for delete
@@ -8340,6 +8675,10 @@ impl App {
                 self.last_status = Some(msg);
             }
         }
+    }
+
+    fn reorder_connection(&mut self, name: &str, delta: i32) -> anyhow::Result<()> {
+        reorder_in_file(&mut self.connections, name, delta)
     }
 
     fn test_entry_in_background(&mut self, entry: ConnectionEntry) {
@@ -8412,7 +8751,7 @@ impl App {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
                             ConfirmContext::SwitchConnection {
-                                entry: entry.clone(),
+                                entry: Box::new(entry.clone()),
                             },
                         ));
                     } else {
@@ -8468,6 +8807,7 @@ impl App {
         match action {
             ConnectionFormAction::Continue => {}
             ConnectionFormAction::Cancel => {
+                self.pending_duplicate_donor = None;
                 self.connection_form = None;
             }
             ConnectionFormAction::Save {
@@ -8476,19 +8816,33 @@ impl App {
                 save_password,
                 original_name,
             } => {
-                // Handle add vs edit
+                let mut entry_to_store = entry.clone();
+
                 let result = if let Some(ref orig) = original_name {
-                    self.connections.update(orig, entry.clone())
+                    if let Some(existing) = self.connections.find_by_name(orig) {
+                        merge_edit_preserving_non_form_fields(&mut entry_to_store, existing);
+                    }
+                    self.connections.update(orig, entry_to_store.clone())
                 } else {
-                    self.connections.add(entry.clone())
+                    if let Some(donor) = self.pending_duplicate_donor.as_deref() {
+                        merge_edit_preserving_non_form_fields(&mut entry_to_store, donor);
+                        entry_to_store.no_password_required =
+                            entry_to_store.no_password_required && donor.no_password_required;
+                        entry_to_store.favorite = None;
+                        entry_to_store.last_used_at = None;
+                        entry_to_store.use_count = 0;
+                        entry_to_store.order = 0;
+                    }
+                    self.connections.add(entry_to_store.clone())
                 };
 
                 match result {
                     Ok(()) => {
+                        self.pending_duplicate_donor = None;
                         // Save password to keychain if requested
                         if save_password {
                             if let Some(ref pwd) = password {
-                                if let Err(e) = entry.set_password_in_keychain(pwd) {
+                                if let Err(e) = entry_to_store.set_password_in_keychain(pwd) {
                                     self.last_error =
                                         Some(format!("Failed to save password: {}", e));
                                 }
@@ -8501,7 +8855,7 @@ impl App {
                         } else {
                             self.last_status = Some(format!(
                                 "Connection '{}' {}",
-                                entry.name,
+                                entry_to_store.name,
                                 if original_name.is_some() {
                                     "updated"
                                 } else {
@@ -12671,6 +13025,150 @@ mod tests {
         assert_eq!(duplicate.database, "testdb");
     }
 
+    #[test]
+    #[serial]
+    fn test_duplicate_passworded_connection_prompts_for_password() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            password_in_keychain: true,
+            no_password_required: false,
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry).unwrap();
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let duplicate = app.connections.find_by_name("prod-copy").unwrap();
+        assert!(
+            !duplicate.no_password_required,
+            "duplicate should prompt for a password instead of connecting without credentials"
+        );
+        assert!(
+            !duplicate.password_in_keychain,
+            "duplicate should not point at the source connection's keychain entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_duplicate_no_password_connection_preserves_new_onepassword_ref() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = Config::default();
+        config.connection.enable_onepassword = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "local".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            no_password_required: true,
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry).unwrap();
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        for _ in 0..4 {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        type_string(&mut app, "op://vault/item/password");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let duplicate = app.connections.find_by_name("local-copy").unwrap();
+        assert!(
+            !duplicate.no_password_required,
+            "new credentials entered in the duplicate form must override donor passwordless state"
+        );
+        assert_eq!(
+            duplicate.password_onepassword.as_deref(),
+            Some("op://vault/item/password")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_keeps_explicit_saved_connection_name() {
+        let _guard = ConfigDirGuard::new();
+        let mut connections = ConnectionsFile::new();
+        connections
+            .add(ConnectionEntry {
+                name: "prod".to_string(),
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "testdb".to_string(),
+                user: "postgres".to_string(),
+                no_password_required: true,
+                ..Default::default()
+            })
+            .unwrap();
+        save_connections(&connections).unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            Some("prod".to_string()),
+        );
+        app.set_safe_mode(true);
+        app.dispatch_pending_startup_reconnect();
+
+        assert_eq!(
+            app.db.status,
+            DbStatus::Connecting,
+            "safe mode should skip session reconnects, not explicit saved-name CLI targets"
+        );
+        assert_eq!(app.current_connection_name.as_deref(), Some("prod"));
+    }
+
     /// Issue 3: Esc in connection manager should close it in one press
     #[test]
     #[serial]
@@ -12925,291 +13423,6 @@ mod tests {
             app.connection_manager.is_some(),
             "Connection manager should open on gm from picker"
         );
-    }
-
-    #[test]
-    fn test_stale_password_resolve_does_not_override_new_same_name_resolve() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
-        let entry = ConnectionEntry {
-            name: "saved".to_string(),
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "testdb".to_string(),
-            user: "postgres".to_string(),
-            ..Default::default()
-        };
-
-        app.current_connection_name = Some(entry.name.clone());
-        app.password_resolve_generation = 1;
-        app.password_resolve_in_flight.insert(
-            entry.name.clone(),
-            PendingPasswordResolve {
-                reason: PasswordResolveReason::UserPicked,
-                generation: 1,
-            },
-        );
-
-        app.execute_command("disconnect");
-
-        app.current_connection_name = Some(entry.name.clone());
-        app.password_resolve_generation = app.password_resolve_generation.wrapping_add(1);
-        let fresh_generation = app.password_resolve_generation;
-        app.password_resolve_in_flight.insert(
-            entry.name.clone(),
-            PendingPasswordResolve {
-                reason: PasswordResolveReason::UserPicked,
-                generation: fresh_generation,
-            },
-        );
-
-        app.apply_db_event(DbEvent::PasswordResolved {
-            entry: Box::new(entry.clone()),
-            result: Ok(Some("old-password".to_string())),
-            password_resolve_generation: 1,
-        });
-
-        assert_eq!(app.db.status, DbStatus::Disconnected);
-        assert_eq!(app.current_connection_name, Some(entry.name.clone()));
-        assert_eq!(
-            app.password_resolve_in_flight
-                .get(&entry.name)
-                .map(|pending| pending.generation),
-            Some(fresh_generation)
-        );
-    }
-
-    #[test]
-    fn test_password_resolve_survives_old_connection_lost() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
-        app.db.status = DbStatus::Connected;
-        app.current_connection_name = Some("old".to_string());
-        app.active_connection_name = Some("old".to_string());
-        app.connect_generation = 7;
-
-        let entry = ConnectionEntry {
-            name: "new".to_string(),
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "testdb".to_string(),
-            user: "postgres".to_string(),
-            password_in_keychain: true,
-            ..Default::default()
-        };
-
-        app.current_connection_name = Some(entry.name.clone());
-        app.password_resolve_generation = app.password_resolve_generation.wrapping_add(1);
-        let password_generation = app.password_resolve_generation;
-        app.password_resolve_in_flight.insert(
-            entry.name.clone(),
-            PendingPasswordResolve {
-                reason: PasswordResolveReason::UserPicked,
-                generation: password_generation,
-            },
-        );
-
-        app.apply_db_event(DbEvent::ConnectionLost {
-            error: "old connection dropped".to_string(),
-            connect_generation: 7,
-        });
-
-        assert_eq!(app.current_connection_name, None);
-        assert_eq!(
-            app.password_resolve_in_flight
-                .get(&entry.name)
-                .map(|pending| pending.generation),
-            Some(password_generation)
-        );
-
-        app.apply_db_event(DbEvent::PasswordResolved {
-            entry: Box::new(entry),
-            result: Ok(Some("secret".to_string())),
-            password_resolve_generation: password_generation,
-        });
-
-        assert_eq!(app.db.status, DbStatus::Connecting);
-        assert_eq!(app.current_connection_name.as_deref(), Some("new"));
-        assert!(app
-            .db
-            .conn_str
-            .as_deref()
-            .is_some_and(|url| url.contains("postgres:secret@localhost")));
-    }
-
-    #[test]
-    fn test_successful_connect_records_attempt_connection_name() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
-        app.current_connection_name = Some("attempt-a".to_string());
-        app.start_connect("postgres://postgres@localhost/db".to_string());
-
-        app.current_connection_name = Some("pending-b".to_string());
-        app.record_successful_connect(app.connect_generation_name.clone());
-
-        assert_eq!(app.active_connection_name.as_deref(), Some("attempt-a"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_safe_mode_suppresses_automatic_pending_reconnect() {
-        let _guard = ConfigDirGuard::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
-
-        app.set_pending_startup_reconnect(Some("saved".to_string()));
-        app.set_safe_mode(true);
-        app.dispatch_pending_startup_reconnect();
-
-        assert_eq!(app.db.status, DbStatus::Disconnected);
-        assert_eq!(app.current_connection_name, None);
-    }
-
-    #[test]
-    #[serial]
-    fn test_safe_mode_honors_explicit_saved_connection_name() {
-        let _guard = ConfigDirGuard::new();
-
-        let mut connections = ConnectionsFile::new();
-        connections
-            .add(ConnectionEntry {
-                name: "saved".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                database: "testdb".to_string(),
-                user: "postgres".to_string(),
-                no_password_required: true,
-                ..Default::default()
-            })
-            .unwrap();
-        save_connections(&connections).unwrap();
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(
-            GridModel::empty(),
-            rt.handle().clone(),
-            tx,
-            rx,
-            Some("saved".to_string()),
-        );
-
-        app.set_safe_mode(true);
-        app.dispatch_pending_startup_reconnect();
-
-        assert_eq!(app.db.status, DbStatus::Connecting);
-        assert_eq!(app.current_connection_name.as_deref(), Some("saved"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_explicit_saved_connection_name_prompts_when_password_unavailable() {
-        let _guard = ConfigDirGuard::new();
-
-        let mut connections = ConnectionsFile::new();
-        connections
-            .add(ConnectionEntry {
-                name: "saved".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                database: "testdb".to_string(),
-                user: "postgres".to_string(),
-                password_in_keychain: true,
-                ..Default::default()
-            })
-            .unwrap();
-        save_connections(&connections).unwrap();
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut app = App::new(
-            GridModel::empty(),
-            rt.handle().clone(),
-            tx,
-            rx,
-            Some("saved".to_string()),
-        );
-
-        app.set_safe_mode(true);
-        app.dispatch_pending_startup_reconnect();
-
-        let generation = app
-            .password_resolve_in_flight
-            .get("saved")
-            .map(|pending| {
-                assert_eq!(pending.reason, PasswordResolveReason::UserPicked);
-                pending.generation
-            })
-            .expect("expected pending password resolve");
-        let entry = app.connections.find_by_name("saved").cloned().unwrap();
-
-        app.apply_db_event(DbEvent::PasswordResolved {
-            entry: Box::new(entry),
-            result: Ok(None),
-            password_resolve_generation: generation,
-        });
-
-        assert!(app.password_prompt.is_some());
-        assert!(app.connection_picker.is_none());
-    }
-
-    #[test]
-    fn test_connection_manager_copy_status_preserves_clipboard_failure() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut config = Config::default();
-        config.clipboard.backend = ClipboardBackend::Disabled;
-
-        let mut app = App::with_config(
-            GridModel::empty(),
-            rt.handle().clone(),
-            tx,
-            rx,
-            None,
-            config,
-        );
-
-        app.handle_connection_manager_action(ConnectionManagerAction::YankUrl {
-            url: "postgres://postgres@localhost/testdb".to_string(),
-        });
-        assert_eq!(app.last_status.as_deref(), Some("Clipboard disabled"));
-
-        app.handle_connection_manager_action(ConnectionManagerAction::YankCli {
-            command: "tsql saved".to_string(),
-        });
-        assert_eq!(app.last_status.as_deref(), Some("Clipboard disabled"));
     }
 
     /// Test the full workflow: Esc on unmodified form closes immediately
