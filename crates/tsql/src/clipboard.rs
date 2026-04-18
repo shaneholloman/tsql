@@ -202,13 +202,17 @@ mod tests {
     fn copy_with_wl_copy_surfaces_stderr_on_failure() {
         let dir = TempDir::new().unwrap();
         let fake = dir.path().join("wl-copy");
-        // Must read stdin before exiting to avoid EPIPE race on fast Linux systems
-        write_executable(&fake, "#!/bin/sh\ncat >/dev/null\necho boom 1>&2\nexit 1\n");
+        write_executable(&fake, "#!/bin/sh\necho boom 1>&2\nexit 1\n");
+        let status = Command::new(&fake)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
 
         let cfg = base_cfg();
-        let err = copy_with_wl_copy("hello", &cfg, &fake)
-            .unwrap_err()
-            .to_string();
+        let err = copy_with_wl_copy("", &cfg, &fake).unwrap_err().to_string();
         assert!(err.contains("boom"));
     }
 
